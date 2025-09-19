@@ -36,7 +36,7 @@ SpineCheck-AI/
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/SpineCheck-AI.git
+git clone https://github.com/harunnilkhan/SpineCheck-AI.git
 cd SpineCheck-AI
 ```
 
