@@ -1,0 +1,20 @@
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.main-container {
+  flex-grow: 1;
+  padding-top: 1rem;
+  padding-bottom: 3rem;
+}
+
+/* Override Bootstrap styles */
+.btn-primary {
+  background-color: #0056b3;
+}
+
+.btn-primary:hover {
+  background-color: #004494;
+}

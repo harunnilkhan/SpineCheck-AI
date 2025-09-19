@@ -1,0 +1,88 @@
+.result-card {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  border-radius: 10px;
+  border: none;
+}
+
+.info-card {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  border-radius: 10px;
+  border: none;
+  background-color: #f8f9fa;
+}
+
+.result-image-container {
+  margin: 1rem 0;
+}
+
+.result-image {
+  max-width: 100%;
+  max-height: 500px;
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+}
+
+.result-stat-container {
+  padding: 10px;
+  background-color: #f8f9fa;
+  border-radius: 8px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+}
+
+.stat-label {
+  color: #6c757d;
+  margin-bottom: 5px;
+}
+
+.stat-value {
+  font-size: 1.8rem;
+  font-weight: 700;
+  color: #212529;
+}
+
+.classification-badge {
+  font-size: 1.1rem;
+  padding: 8px 15px;
+}
+
+.angles-list {
+  list-style-type: none;
+  padding-left: 0.5rem;
+}
+
+.angle-item {
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+}
+
+.classification-list {
+  list-style-type: none;
+  padding-left: 0;
+}
+
+.classification-list li {
+  margin-bottom: 0.5rem;
+}
+
+.disclaimer-text {
+  font-size: 0.8rem;
+  color: #6c757d;
+  border-top: 1px solid #dee2e6;
+  padding-top: 1rem;
+}
+
+.download-btn,
+.reset-btn {
+  font-weight: 500;
+}
+
+.nav-tabs .nav-link {
+  color: #495057;
+  font-weight: 500;
+}
+
+.nav-tabs .nav-link.active {
+  color: #007bff;
+  font-weight: 600;
+}
