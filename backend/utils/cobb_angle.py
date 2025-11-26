@@ -1,634 +1,975 @@
 """
-Advanced Cobb Angle Calculator for SpineCheck-AI
-Improved algorithm to automatically detect and exclude outlier vertebrae
-that are distant from the main spine curve.
+Improved Cobb Angle Measurement Module for SpineCheck-AI
+=========================================================
+Enhanced version with robust handling of imperfect segmentations:
+- ROI detection to focus on spine region
+- Morphological operations to separate merged vertebrae
+- Artifact removal using geometric constraints
+- Vertebra splitting for merged components
+- No artificial zeroing for mild curvatures
 """
 
 import numpy as np
 import cv2
-import math
-from scipy.ndimage import label, find_objects, center_of_mass
-from scipy import stats
+from scipy import stats, ndimage
+from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
+import warnings
 
-# ---- Visualization style (top-level constants) ----
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-TEXT_SCALE = 0.85
-TEXT_THICK = 2
-TEXT_COLOR = (0, 200, 255)    # amber
-TEXT_SHADOW = (0, 0, 0)
+# ============================================================================
+# Configuration Parameters
+# ============================================================================
 
-CURVE_COLOR = (255, 255, 0)   # spine curve
-CURVE_THICK = 3               # ↑ was 2
+# Classification thresholds (in degrees)
+NORMAL_THRESHOLD = 10.0
+MILD_THRESHOLD = 25.0
+MODERATE_THRESHOLD = 40.0
+SEVERE_THRESHOLD = 60.0
 
-ANGLE_COLOR = (0, 0, 255)     # Cobb arms
-ANGLE_THICK = 4               # ↑ was 2
+# Algorithm parameters
+MAX_ENDPLATE_ANGLE = 35.0
+MAX_COBB_ANGLE = 80.0
+MIN_VERTEBRA_SEPARATION = 2
+MAX_VERTEBRA_SEPARATION = 10
+OUTLIER_STD_MULTIPLIER = 2.5
+NUM_ENDPLATE_SAMPLES = 20
+MIN_VERTEBRA_AREA = 100
+MAX_VERTEBRA_AREA = 100000
 
-INCLUDED_DOT = (0, 255, 0)    # included vertebrae
-END_DOT = (0, 165, 255)       # end vertebrae
-OUTLIER_DOT = (0, 0, 255)     # outliers
-DOT_RADIUS = 5
+# New parameters for improved robustness
+MIN_VERTEBRA_HEIGHT = 10
+MIN_VERTEBRA_WIDTH = 15
+MAX_ASPECT_RATIO = 6.0
+ROI_WIDTH_FACTOR = 0.5
+VERTEBRA_MERGE_THRESHOLD = 3.0
+EROSION_ITERATIONS = 1
+MIN_VERTEBRA_SOLIDITY = 0.25
 
 
-def _draw_text(img, text, org, color=TEXT_COLOR):
-    """Readable text with soft shadow."""
-    cv2.putText(img, text, (org[0] + 1, org[1] + 1),
-                FONT, TEXT_SCALE, TEXT_SHADOW, TEXT_THICK + 2, cv2.LINE_AA)
-    cv2.putText(img, text, org,
-                FONT, TEXT_SCALE, color, TEXT_THICK, cv2.LINE_AA)
+# ============================================================================
+# Data Structures
+# ============================================================================
 
-
-
+@dataclass
 class VertebraInfo:
-    """Class to store vertebra information"""
+    """Information about a single vertebra"""
+    id: int  # Vertebra index (1-based, from top to bottom)
+    mask: np.ndarray  # Binary mask for this vertebra
+    center: Tuple[float, float]  # (y, x) centroid coordinates
 
-    def __init__(self, id, mask, center, bbox):
-        self.id = id
-        self.mask = mask
-        self.center = center  # (y, x) format
-        self.bbox = bbox  # (y_min, x_min, y_max, x_max)
-        self.contour = None
-        self.area = 0
-        self.superior_endplate_slope = None  # M1
-        self.inferior_endplate_slope = None  # M2
-        self.superior_endplate_points = []  # Points for superior endplate
-        self.inferior_endplate_points = []  # Points for inferior endplate
-        self.is_end_vertebra = False  # Flag to mark top or bottom vertebrae
-        self.is_outlier = False  # Flag to mark vertebrae that are outliers from the main curve
-        self.distance_from_curve = 0.0  # Distance from the vertebra to the spine curve
+    # Endplate geometry
+    superior_endplate_points: Optional[np.ndarray] = None  # (N, 2) array of (x, y) points
+    inferior_endplate_points: Optional[np.ndarray] = None  # (N, 2) array of (x, y) points
+    superior_endplate_angle: Optional[float] = None  # degrees
+    inferior_endplate_angle: Optional[float] = None  # degrees
+    superior_endplate_slope: Optional[float] = None  # tan(angle)
+    inferior_endplate_slope: Optional[float] = None  # tan(angle)
+
+    # Status flags
+    is_end_vertebra: bool = False  # First or last vertebra
+    is_outlier: bool = False  # Too far from spine centerline
+
+    # Minimum enclosing rectangle
+    min_rect: Optional[Tuple] = None  # Output from cv2.minAreaRect
+
+    # Additional properties for robustness
+    area: int = 0
+    solidity: float = 0.0
+    aspect_ratio: float = 0.0
+
+    def __repr__(self):
+        sup_ang = f"{self.superior_endplate_angle:.1f}" if self.superior_endplate_angle is not None else "None"
+        inf_ang = f"{self.inferior_endplate_angle:.1f}" if self.inferior_endplate_angle is not None else "None"
+        return f"Vertebra(id={self.id}, center={self.center}, sup={sup_ang}°, inf={inf_ang}°, area={self.area})"
 
 
-def extract_green_mask(image):
-    """Extract green highlighted areas from the input image"""
-    # Convert to HSV for better color detection
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def detect_spine_roi(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    """
+    Detect the region of interest containing the spine.
+
+    This helps exclude artifacts on the sides (ribs, scale markers, etc.)
+    by focusing on the central vertical column where the spine is located.
+
+    Args:
+        mask: Binary mask of all detected regions
+
+    Returns:
+        (x_min, x_max, y_min, y_max) defining the ROI
+    """
+    h, w = mask.shape
+
+    # Find all non-zero points
+    points = np.column_stack(np.where(mask > 0))
+
+    if len(points) == 0:
+        # Return full image if no points found
+        return 0, w, 0, h
+
+    # Calculate vertical projection (sum along rows)
+    vertical_projection = np.sum(mask, axis=0)
+
+    # Find the main vertical region with smoothing
+    smoothed_projection = ndimage.gaussian_filter1d(vertical_projection.astype(float), sigma=5)
+
+    # Find peak and determine ROI width
+    peak_x = np.argmax(smoothed_projection)
+    roi_half_width = int(w * ROI_WIDTH_FACTOR / 2)
+
+    # Calculate ROI bounds
+    x_min = max(0, peak_x - roi_half_width)
+    x_max = min(w, peak_x + roi_half_width)
+
+    # For y bounds, use the actual extent of the mask within the x ROI
+    roi_mask = mask[:, x_min:x_max]
+    y_coords = np.where(np.any(roi_mask > 0, axis=1))[0]
+
+    if len(y_coords) > 0:
+        y_min = y_coords[0]
+        y_max = y_coords[-1] + 1
+    else:
+        y_min, y_max = 0, h
+
+    return x_min, x_max, y_min, y_max
+
+
+def apply_roi_to_mask(mask: np.ndarray, roi: Tuple[int, int, int, int]) -> np.ndarray:
+    """
+    Apply ROI to mask, zeroing out regions outside the ROI.
+
+    Args:
+        mask: Binary mask
+        roi: (x_min, x_max, y_min, y_max) ROI bounds
+
+    Returns:
+        Masked image with regions outside ROI set to zero
+    """
+    x_min, x_max, y_min, y_max = roi
+    roi_mask = np.zeros_like(mask)
+    roi_mask[y_min:y_max, x_min:x_max] = mask[y_min:y_max, x_min:x_max]
+    return roi_mask
+
+
+def separate_merged_vertebrae(mask: np.ndarray) -> np.ndarray:
+    """
+    Attempt to separate merged vertebrae using adaptive morphological operations.
+    Uses a gentler approach to avoid breaking apart valid vertebrae.
+
+    Args:
+        mask: Binary mask with potentially merged vertebrae
+
+    Returns:
+        Processed mask with separated vertebrae
+    """
+    # First check if separation is needed by analyzing component sizes
+    num_labels_orig, labels_orig = cv2.connectedComponents(mask)
+
+    # If we already have a reasonable number of components, be very gentle
+    if num_labels_orig > 10:  # Already have many components
+        # Just do light opening to clean up connections
+        kernel_light = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_light, iterations=1)
+
+    # Apply gradient-based separation for truly merged regions
+    # Use distance transform to find centers of merged regions
+    dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+
+    # Find peaks in the distance transform (vertebra centers)
+    # Threshold to get only the strongest peaks
+    _, sure_fg = cv2.threshold(dist_transform, 0.3 * dist_transform.max(), 255, 0)
+    sure_fg = np.uint8(sure_fg)
+
+    # Find unknown region (between foreground and background)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    sure_bg = cv2.dilate(mask, kernel, iterations=2)
+    unknown = cv2.subtract(sure_bg, sure_fg)
+
+    # Marker labelling for watershed
+    num_markers, markers = cv2.connectedComponents(sure_fg)
+
+    # Add 1 to all labels so that background is 1, not 0
+    markers = markers + 1
+
+    # Mark the unknown region as 0
+    markers[unknown == 255] = 0
+
+    # Apply watershed if we have multiple markers
+    if num_markers > 2:  # More than just background
+        # Convert mask to 3-channel for watershed
+        mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        markers = cv2.watershed(mask_3ch, markers)
+
+        # Create result mask
+        separated_mask = np.zeros_like(mask)
+        separated_mask[markers > 1] = 255
+
+        # Clean up with light morphological operations
+        kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        separated_mask = cv2.morphologyEx(separated_mask, cv2.MORPH_CLOSE, kernel_small)
+
+        return separated_mask
+    else:
+        # If watershed didn't help, try gentle erosion
+        kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        eroded = cv2.erode(mask, kernel_erode, iterations=EROSION_ITERATIONS)
+
+        # Find connected components in eroded image
+        num_labels, labels = cv2.connectedComponents(eroded)
+
+        # If erosion created more components, use it
+        if num_labels > num_labels_orig + 2:
+            # Dilate each component separately
+            separated_mask = np.zeros_like(mask)
+            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+            for label_id in range(1, num_labels):
+                component = (labels == label_id).astype(np.uint8) * 255
+                # Dilate back carefully
+                dilated = cv2.dilate(component, kernel_dilate, iterations=EROSION_ITERATIONS)
+                # Only keep the dilation within original mask bounds
+                dilated = cv2.bitwise_and(dilated, mask)
+                separated_mask = cv2.bitwise_or(separated_mask, dilated)
+
+            return separated_mask
+        else:
+            # Return original if separation didn't help
+            return mask
+
+
+def split_large_component(component_mask: np.ndarray, max_vertebra_height: int = 80) -> List[np.ndarray]:
+    """
+    Split a large connected component that likely contains multiple vertebrae.
+
+    Args:
+        component_mask: Binary mask of a single large component
+        max_vertebra_height: Estimated maximum height of a single vertebra
+
+    Returns:
+        List of binary masks for split vertebrae
+    """
+    # Find the bounding box
+    coords = np.column_stack(np.where(component_mask > 0))
+    if len(coords) == 0:
+        return [component_mask]
+
+    y_min, x_min = coords.min(axis=0)
+    y_max, x_max = coords.max(axis=0)
+    height = y_max - y_min
+
+    # If component is not too tall, return as is
+    if height <= max_vertebra_height:
+        return [component_mask]
+
+    # Estimate number of vertebrae in this component
+    num_vertebrae = max(2, min(5, int(height / (max_vertebra_height * 0.7))))
+
+    # Try horizontal cutting with varying intensities
+    split_masks = []
+
+    for strength in [0.3, 0.5, 0.7]:
+        # Create horizontal cuts at regular intervals
+        temp_mask = component_mask.copy()
+        cut_height = 3  # Height of each cut
+
+        for i in range(1, num_vertebrae):
+            cut_y = y_min + int(i * height / num_vertebrae)
+            cut_start = max(0, cut_y - cut_height // 2)
+            cut_end = min(temp_mask.shape[0], cut_y + cut_height // 2)
+
+            # Reduce the mask intensity at cut locations
+            temp_mask[cut_start:cut_end, :] = (temp_mask[cut_start:cut_end, :] * (1 - strength)).astype(np.uint8)
+
+        # Apply threshold and find new components
+        temp_mask = (temp_mask > 128).astype(np.uint8) * 255
+        num_labels, labels = cv2.connectedComponents(temp_mask)
+
+        # Collect the split components
+        if num_labels > 2:  # More than just background and one component
+            split_masks = []
+            for label_id in range(1, num_labels):
+                split_mask = (labels == label_id).astype(np.uint8) * 255
+                # Apply original mask to maintain boundaries
+                split_mask = cv2.bitwise_and(split_mask, component_mask)
+                if np.sum(split_mask) > MIN_VERTEBRA_AREA * 255:
+                    split_masks.append(split_mask)
+
+            if len(split_masks) >= 2:
+                return split_masks
+
+    # If splitting failed, return original
+    return [component_mask]
+
+
+def extract_green_mask(image: np.ndarray) -> np.ndarray:
+    """
+    Extract the green/cyan highlighted vertebrae region from the image.
+    Enhanced version with better color detection and noise removal.
+
+    Args:
+        image: BGR image with vertebrae highlighted in green/cyan
+
+    Returns:
+        Binary mask (0 or 255) of the highlighted region
+    """
+    # Convert to HSV for better color segmentation
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    # Define range of green color in HSV
-    lower_green = np.array([35, 50, 50])
-    upper_green = np.array([90, 255, 255])
+    # Define range for green/cyan colors in HSV (broader range)
+    lower_green = np.array([25, 40, 40])
+    upper_green = np.array([95, 255, 255])
 
-    # Threshold the HSV image to get only green colors
+    # Create mask for green regions
     green_mask = cv2.inRange(hsv, lower_green, upper_green)
 
-    # Apply morphological operations to clean mask
+    # Also check for bright green in BGR space
+    b, g, r = cv2.split(image)
+    bright_green = (g > 80) & (g > r * 1.3) & (g > b * 1.3)
+    bright_green = bright_green.astype(np.uint8) * 255
+
+    # Combine masks
+    combined_mask = cv2.bitwise_or(green_mask, bright_green)
+
+    # Remove small noise with opening
+    kernel_small = np.ones((2, 2), np.uint8)
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_small)
+
+    # Fill small holes
     kernel = np.ones((3, 3), np.uint8)
-    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    return green_mask
-
-
-def segment_vertebrae(mask, min_area=100):
-    """Segment spine mask into individual vertebrae."""
-    # Ensure mask is binary
-    binary_mask = (mask > 0).astype(np.uint8)
-
-    # Check if mask is empty
-    if np.sum(binary_mask) == 0:
-        return np.zeros_like(binary_mask), 0
-
-    # Use connected components to label vertebrae
-    labeled_mask, num_vertebrae = label(binary_mask)
-
-    # Filter small components
-    for i in range(1, num_vertebrae + 1):
-        component = (labeled_mask == i)
-        if np.sum(component) < min_area:
-            labeled_mask[component] = 0
-
-    # Relabel to ensure consecutive labels
-    if num_vertebrae > 0:
-        temp_mask = np.zeros_like(labeled_mask)
-        new_label = 1
-        for i in range(1, num_vertebrae + 1):
-            component = (labeled_mask == i)
-            if np.sum(component) > 0:  # Skip labels that were zeroed
-                temp_mask[component] = new_label
-                new_label += 1
-
-        labeled_mask = temp_mask
-        num_vertebrae = new_label - 1
-
-    return labeled_mask, num_vertebrae
+    return combined_mask
 
 
-def algorithm1_minimum_enclosing_rectangle(vertebra_info):
+def filter_by_geometry(contour: np.ndarray) -> Tuple[bool, Dict]:
     """
-    Algorithm 1: Calculate the minimum enclosing rectangle for a vertebra
-    and determine superior and inferior endplate points.
+    Check if a contour has the geometric properties of a vertebra.
+
+    Args:
+        contour: OpenCV contour
+
+    Returns:
+        (is_valid, properties) where properties contains area, solidity, aspect_ratio
     """
-    # Prepare vertebra mask
-    mask = vertebra_info.mask.astype(np.uint8)
+    area = cv2.contourArea(contour)
 
-    # Find vertebra contour
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Quick area check
+    if area < MIN_VERTEBRA_AREA or area > MAX_VERTEBRA_AREA:
+        return False, {'area': area, 'solidity': 0, 'aspect_ratio': 0}
 
-    if not contours:
-        return vertebra_info
+    # Get bounding box
+    x, y, w, h = cv2.boundingRect(contour)
 
-    contour = max(contours, key=cv2.contourArea)
-    vertebra_info.contour = contour
-    vertebra_info.area = cv2.contourArea(contour)
+    # Check dimensions
+    if h < MIN_VERTEBRA_HEIGHT or w < MIN_VERTEBRA_WIDTH:
+        return False, {'area': area, 'solidity': 0, 'aspect_ratio': 0}
 
-    # Calculate minimum area rectangle
-    min_rect = cv2.minAreaRect(contour)
+    # Calculate aspect ratio
+    aspect_ratio = max(w/h, h/w)
+    if aspect_ratio > MAX_ASPECT_RATIO:
+        return False, {'area': area, 'solidity': 0, 'aspect_ratio': aspect_ratio}
 
-    # Get the four corner coordinates of the rectangle
-    rect_points = cv2.boxPoints(min_rect)
+    # Calculate solidity (area / convex hull area)
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    solidity = area / hull_area if hull_area > 0 else 0
 
-    # Sort points by y-coordinate (top to bottom)
-    rect_points = rect_points[rect_points[:, 1].argsort()]
+    if solidity < MIN_VERTEBRA_SOLIDITY:
+        return False, {'area': area, 'solidity': solidity, 'aspect_ratio': aspect_ratio}
 
-    # The top two points belong to superior endplate
-    # The bottom two points belong to inferior endplate
-    superior_points = rect_points[:2]
-    inferior_points = rect_points[2:]
-
-    # Sort each pair by x-coordinate for consistent ordering
-    superior_points = superior_points[superior_points[:, 0].argsort()]
-    inferior_points = inferior_points[inferior_points[:, 0].argsort()]
-
-    # Perform interpolation to obtain more coordinate points
-    # For superior endplate
-    x1, y1 = superior_points[0]
-    x2, y2 = superior_points[1]
-
-    # Create 5 interpolation points along the line
-    for i in range(5):
-        t = i / 4.0  # Parameter from 0 to 1
-        x = x1 + t * (x2 - x1)
-        y = y1 + t * (y2 - y1)
-        vertebra_info.superior_endplate_points.append((x, y))
-
-    # For inferior endplate
-    x1, y1 = inferior_points[0]
-    x2, y2 = inferior_points[1]
-
-    # Create 5 interpolation points along the line
-    for i in range(5):
-        t = i / 4.0  # Parameter from 0 to 1
-        x = x1 + t * (x2 - x1)
-        y = y1 + t * (y2 - y1)
-        vertebra_info.inferior_endplate_points.append((x, y))
-
-    # Fit the coordinates using least square method
-    # For superior endplate
-    superior_xs = [p[0] for p in vertebra_info.superior_endplate_points]
-    superior_ys = [p[1] for p in vertebra_info.superior_endplate_points]
-
-    if len(superior_xs) >= 2:
-        try:
-            slope, _, _, _, _ = stats.linregress(superior_xs, superior_ys)
-            vertebra_info.superior_endplate_slope = slope
-        except:
-            pass
-
-    # For inferior endplate
-    inferior_xs = [p[0] for p in vertebra_info.inferior_endplate_points]
-    inferior_ys = [p[1] for p in vertebra_info.inferior_endplate_points]
-
-    if len(inferior_xs) >= 2:
-        try:
-            slope, _, _, _, _ = stats.linregress(inferior_xs, inferior_ys)
-            vertebra_info.inferior_endplate_slope = slope
-        except:
-            pass
-
-    return vertebra_info
+    return True, {'area': area, 'solidity': solidity, 'aspect_ratio': aspect_ratio}
 
 
-def fit_spine_curve(vertebrae):
-    """Fit a polynomial curve to the vertebrae centers to represent the spine curve."""
-    # Extract centers
-    centers = np.array([(v.center[1], v.center[0]) for v in vertebrae])  # (x, y) format
-
-    # Sort centers by y-coordinate (top to bottom)
-    centers = centers[centers[:, 1].argsort()]
-
-    # Extract x and y coordinates
-    x_coords = centers[:, 0]
-    y_coords = centers[:, 1]
-
-    # Fit a 3rd degree polynomial (cubic) to represent the spine curve
-    try:
-        poly_coeffs = np.polyfit(y_coords, x_coords, 3)
-        y_values = np.linspace(min(y_coords), max(y_coords), 100)
-        return poly_coeffs, y_values
-    except:
-        return None, None
-
-
-def identify_outliers(vertebrae):
-    """Identify vertebrae that are outliers from the main spine curve."""
-    if len(vertebrae) < 5:  # Need enough vertebrae to establish a curve
-        return vertebrae
-
-    # Fit a spine curve
-    poly_coeffs, y_values = fit_spine_curve(vertebrae)
-
-    if poly_coeffs is None:
-        return vertebrae
-
-    # Create spine curve function
-    spine_curve = np.poly1d(poly_coeffs)
-
-    # Calculate distance from each vertebra to the curve
-    distances = []
-    for vertebra in vertebrae:
-        # Get center coordinates
-        y, x = vertebra.center  # Original format (y, x)
-
-        # Calculate expected x-coordinate based on the spine curve
-        expected_x = spine_curve(y)
-
-        # Calculate distance from vertebra center to curve
-        distance = abs(x - expected_x)
-
-        # Store distance
-        vertebra.distance_from_curve = distance
-        distances.append(distance)
-
-    # Calculate threshold for outlier detection
-    mean_distance = np.mean(distances)
-    std_distance = np.std(distances)
-
-    # Mark vertebrae as outliers if they are more than 2 standard deviations from the mean
-    threshold = mean_distance + 2 * std_distance
-
-    for vertebra in vertebrae:
-        if vertebra.distance_from_curve > threshold:
-            vertebra.is_outlier = True
-
-    return vertebrae, poly_coeffs, y_values
-
-
-def extract_vertebrae(mask):
+def extract_vertebrae(mask: np.ndarray) -> List[VertebraInfo]:
     """
-    Extract individual vertebrae from segmentation mask and analyze them
-    using Algorithm 1. Marks topmost, bottommost, and outlier vertebrae
-    to be excluded from angle calculations.
+    Enhanced vertebra extraction with ROI detection and better filtering.
+
+    Args:
+        mask: Binary mask with vertebrae highlighted (0 or 255)
+
+    Returns:
+        List of VertebraInfo objects sorted from top to bottom
     """
-    # Ensure mask is single channel
-    if len(mask.shape) > 2:
-        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    # Step 1: Detect and apply ROI to focus on spine region
+    roi = detect_spine_roi(mask)
+    mask_roi = apply_roi_to_mask(mask, roi)
 
-    # Ensure binary mask
-    binary_mask = (mask > 0).astype(np.uint8)
+    # Step 2: Separate merged vertebrae
+    separated_mask = separate_merged_vertebrae(mask_roi)
 
-    # Segment vertebrae
-    labeled_mask, num_vertebrae = segment_vertebrae(binary_mask)
+    # Step 3: Find connected components
+    contours, _ = cv2.findContours(separated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    if num_vertebrae == 0:
-        return []
-
-    # Analyze vertebrae
     vertebrae = []
 
-    for i in range(1, num_vertebrae + 1):
-        # Create mask for this vertebra
-        vertebra_mask = (labeled_mask == i)
-
-        # Skip small components (likely noise)
-        if np.sum(vertebra_mask) < 100:
+    for contour in contours:
+        # Filter by geometry
+        is_valid, props = filter_by_geometry(contour)
+        if not is_valid:
             continue
 
-        # Find bounding box
-        regions = find_objects(vertebra_mask)
-        if not regions:
-            continue
+        # Create individual mask for this vertebra
+        vert_mask = np.zeros(mask.shape, dtype=np.uint8)
+        cv2.drawContours(vert_mask, [contour], -1, 255, -1)
 
-        bbox_slice = regions[0]
-        y_min, x_min = bbox_slice[0].start, bbox_slice[1].start
-        y_max, x_max = bbox_slice[0].stop, bbox_slice[1].stop
+        # Check if this component might be multiple merged vertebrae
+        x, y, w, h = cv2.boundingRect(contour)
+        if h > w * VERTEBRA_MERGE_THRESHOLD and props['area'] > 3000:
+            # Try to split it
+            split_masks = split_large_component(vert_mask)
 
-        # Calculate center of mass
-        cy, cx = center_of_mass(vertebra_mask)
+            for split_mask in split_masks:
+                # Find contour of split mask
+                split_contours, _ = cv2.findContours(split_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if len(split_contours) == 0:
+                    continue
 
-        # Create vertebra info
-        vertebra = VertebraInfo(
-            id=i,
-            mask=vertebra_mask,
-            center=(cy, cx),
-            bbox=(y_min, x_min, y_max, x_max)
-        )
+                split_contour = max(split_contours, key=cv2.contourArea)
+                is_valid, split_props = filter_by_geometry(split_contour)
 
-        # Apply Algorithm 1: Calculate minimum enclosing rectangle and endplates
-        vertebra = algorithm1_minimum_enclosing_rectangle(vertebra)
+                if is_valid:
+                    # Calculate centroid
+                    M = cv2.moments(split_contour)
+                    if M["m00"] > 0:
+                        cx = M["m10"] / M["m00"]
+                        cy = M["m01"] / M["m00"]
 
-        # Add to list
-        vertebrae.append(vertebra)
+                        vert_info = VertebraInfo(
+                            id=0,  # Will be assigned later
+                            mask=split_mask,
+                            center=(cy, cx),
+                            area=split_props['area'],
+                            solidity=split_props['solidity'],
+                            aspect_ratio=split_props['aspect_ratio']
+                        )
+                        vertebrae.append(vert_info)
+        else:
+            # Use original component
+            M = cv2.moments(contour)
+            if M["m00"] > 0:
+                cx = M["m10"] / M["m00"]
+                cy = M["m01"] / M["m00"]
 
-    # Sort vertebrae by y-coordinate (top to bottom)
+                vert_info = VertebraInfo(
+                    id=0,  # Will be assigned later
+                    mask=vert_mask,
+                    center=(cy, cx),
+                    area=props['area'],
+                    solidity=props['solidity'],
+                    aspect_ratio=props['aspect_ratio']
+                )
+                vertebrae.append(vert_info)
+
+    # Sort by y-coordinate (top to bottom)
     vertebrae.sort(key=lambda v: v.center[0])
 
-    # Mark topmost and bottommost vertebrae to exclude from angle calculations
+    # Assign IDs
+    for i, vert in enumerate(vertebrae):
+        vert.id = i + 1
+
+    # Mark end vertebrae (first and last)
     if len(vertebrae) > 0:
-        vertebrae[0].is_end_vertebra = True  # Topmost vertebra
+        vertebrae[0].is_end_vertebra = True
+        if len(vertebrae) > 1:
+            vertebrae[-1].is_end_vertebra = True
 
-    if len(vertebrae) > 1:
-        vertebrae[-1].is_end_vertebra = True  # Bottommost vertebra
-
-    # Identify outlier vertebrae by fitting a curve to the spine
-    if len(vertebrae) > 4:
-        vertebrae, poly_coeffs, y_values = identify_outliers(vertebrae)
-    else:
-        poly_coeffs, y_values = None, None
-
-    # Renumber vertebrae IDs (sequential)
-    for i, vertebra in enumerate(vertebrae):
-        vertebra.id = i + 1
-
-    return vertebrae, poly_coeffs, y_values
+    return vertebrae
 
 
-def algorithm2_cobb_angle_measurement(vertebrae):
-    """
-    Algorithm 2: Calculate Cobb angle between vertebrae with the maximum angle,
-    excluding the topmost, bottommost, and outlier vertebrae.
-    """
-    # Filter vertebrae
-    valid_vertebrae = [v for v in vertebrae
-                      if v.superior_endplate_slope is not None
-                      and v.inferior_endplate_slope is not None
-                      and not v.is_end_vertebra
-                      and not v.is_outlier]
+def normalize_angle(angle_deg: float) -> float:
+    """Normalize angle to range (-90, 90] degrees."""
+    angle_deg = angle_deg % 360
+    if angle_deg > 180:
+        angle_deg -= 360
+
+    if angle_deg > 90:
+        angle_deg -= 180
+    elif angle_deg <= -90:
+        angle_deg += 180
+
+    return angle_deg
+
+
+def fit_robust_line(points: np.ndarray) -> Tuple[float, float]:
+    """Fit a robust line using Theil-Sen regression."""
+    if len(points) < 2:
+        return 0.0, 0.0
+
+    x = points[:, 0]
+    y = points[:, 1]
+
+    if np.std(x) < 1e-6:
+        return 1e6, np.mean(y) if len(y) > 0 else 0.0
+
+    try:
+        slope, intercept, _, _ = stats.theilslopes(y, x)
+        return slope, intercept
+    except Exception:
+        if len(x) >= 2:
+            slope, intercept = np.polyfit(x, y, 1)
+            return slope, intercept
+        return 0.0, np.mean(y) if len(y) > 0 else 0.0
+
+
+def sample_edge_points(rect_points: np.ndarray, num_samples: int = NUM_ENDPLATE_SAMPLES) -> np.ndarray:
+    """Sample points uniformly along an edge."""
+    p1, p2 = rect_points[0], rect_points[1]
+    t = np.linspace(0, 1, num_samples)
+
+    points = np.zeros((num_samples, 2))
+    points[:, 0] = p1[0] + t * (p2[0] - p1[0])
+    points[:, 1] = p1[1] + t * (p2[1] - p1[1])
+
+    return points
+
+
+def compute_acute_angle_difference(angle1_deg: float, angle2_deg: float) -> float:
+    """Compute the acute angle difference between two angles in degrees."""
+    diff = abs(angle1_deg - angle2_deg) % 180
+    return min(diff, 180 - diff)
+
+
+def fit_spine_centerline(vertebrae: List[VertebraInfo], degree: int = 3) -> Tuple[np.poly1d, float]:
+    """Fit a polynomial curve through vertebra centers."""
+    valid_vertebrae = [v for v in vertebrae if not v.is_outlier]
 
     if len(valid_vertebrae) < 2:
-        return 0, None, None, False
+        return np.poly1d([0]), 0.0
 
-    # Extract slopes M1 (superior) and M2 (inferior)
-    M1 = [v.superior_endplate_slope for v in valid_vertebrae]
-    M2 = [v.inferior_endplate_slope for v in valid_vertebrae]
+    x_coords = np.array([v.center[1] for v in valid_vertebrae])
+    y_coords = np.array([v.center[0] for v in valid_vertebrae])
 
-    # Initialize variables
-    max_cobb_angle = 0
-    upper_vertebra_id = None
-    lower_vertebra_id = None
+    try:
+        degree = min(degree, len(valid_vertebrae) - 1)
+        coeffs = np.polyfit(x_coords, y_coords, degree)
+        poly_func = np.poly1d(coeffs)
 
-    # Iterate through all pairs of vertebrae
+        y_pred = poly_func(x_coords)
+        residuals = y_coords - y_pred
+        rmse = np.sqrt(np.mean(residuals**2))
+
+        return poly_func, rmse
+    except Exception as e:
+        warnings.warn(f"Failed to fit spine centerline: {e}")
+        return np.poly1d([0]), 0.0
+
+
+def mark_outliers(vertebrae: List[VertebraInfo]) -> None:
+    """Mark vertebrae that are outliers based on centerline fit."""
+    if len(vertebrae) < 3:
+        return
+
+    poly_func, _ = fit_spine_centerline(vertebrae, degree=2)
+
+    distances = []
+    for vert in vertebrae:
+        if not vert.is_end_vertebra:
+            expected_y = poly_func(vert.center[1])
+            distance = abs(vert.center[0] - expected_y)
+            distances.append(distance)
+
+    if len(distances) > 0:
+        mean_dist = np.mean(distances)
+        std_dist = np.std(distances)
+        threshold = mean_dist + OUTLIER_STD_MULTIPLIER * std_dist
+
+        idx = 0
+        for vert in vertebrae:
+            if not vert.is_end_vertebra:
+                expected_y = poly_func(vert.center[1])
+                distance = abs(vert.center[0] - expected_y)
+                if distance > threshold:
+                    vert.is_outlier = True
+                idx += 1
+
+
+# ============================================================================
+# Core Algorithms
+# ============================================================================
+
+def algorithm1_minimum_enclosing_rectangle(vertebra: VertebraInfo) -> None:
+    """
+    Apply Algorithm 1: Minimum enclosing rectangle and endplate approximation.
+    """
+    points = np.column_stack(np.where(vertebra.mask > 0))
+    points_xy = points[:, [1, 0]]
+
+    if len(points_xy) < 5:
+        return
+
+    min_rect = cv2.minAreaRect(points_xy.astype(np.float32))
+    vertebra.min_rect = min_rect
+
+    box = cv2.boxPoints(min_rect)
+    box = np.int32(box)
+
+    # Determine top and bottom edges
+    sorted_by_y = sorted(box, key=lambda p: p[1])
+    top_points = sorted(sorted_by_y[:2], key=lambda p: p[0])
+    bottom_points = sorted(sorted_by_y[2:], key=lambda p: p[0])
+
+    # Sample points along edges
+    superior_points = sample_edge_points(np.array(top_points))
+    inferior_points = sample_edge_points(np.array(bottom_points))
+
+    # Fit lines to endplates
+    sup_slope, sup_intercept = fit_robust_line(superior_points)
+    inf_slope, inf_intercept = fit_robust_line(inferior_points)
+
+    # Convert to angles
+    sup_angle = np.degrees(np.arctan(sup_slope))
+    inf_angle = np.degrees(np.arctan(inf_slope))
+
+    # Normalize angles
+    sup_angle = normalize_angle(sup_angle)
+    inf_angle = normalize_angle(inf_angle)
+
+    # Validate endplate angles
+    if abs(sup_angle) <= MAX_ENDPLATE_ANGLE:
+        vertebra.superior_endplate_points = superior_points
+        vertebra.superior_endplate_angle = sup_angle
+        vertebra.superior_endplate_slope = sup_slope
+
+    if abs(inf_angle) <= MAX_ENDPLATE_ANGLE:
+        vertebra.inferior_endplate_points = inferior_points
+        vertebra.inferior_endplate_angle = inf_angle
+        vertebra.inferior_endplate_slope = inf_slope
+
+
+def algorithm2_cobb_angle_measurement(vertebrae: List[VertebraInfo]) -> Dict:
+    """
+    Apply Algorithm 2: Cobb angle measurement with improved selection.
+    REMOVED: Straight spine detection that artificially sets angle to 0
+    """
+    valid_vertebrae = [
+        v for v in vertebrae
+        if not v.is_end_vertebra
+        and not v.is_outlier
+        and v.superior_endplate_angle is not None
+        and v.inferior_endplate_angle is not None
+    ]
+
+    if len(valid_vertebrae) < 2:
+        return {
+            'valid': False,
+            'max_angle': 0.0,
+            'superior_vertebra': None,
+            'inferior_vertebra': None
+        }
+
+    # Find the pair with maximum Cobb angle
+    max_angle = 0.0
+    best_pair = None
+
     for i in range(len(valid_vertebrae)):
-        for j in range(i+1, len(valid_vertebrae)):
-            m1 = M1[i]
-            m2 = M2[j]
+        for j in range(i + MIN_VERTEBRA_SEPARATION,
+                       min(len(valid_vertebrae), i + MAX_VERTEBRA_SEPARATION + 1)):
+            v1 = valid_vertebrae[i]
+            v2 = valid_vertebrae[j]
 
-            denominator = 1.0 + (m1 * m2)
-            if abs(denominator) < 1e-6:
-                continue
+            # Try all four combinations
+            angles = [
+                compute_acute_angle_difference(v1.superior_endplate_angle, v2.inferior_endplate_angle),
+                compute_acute_angle_difference(v1.inferior_endplate_angle, v2.superior_endplate_angle),
+                compute_acute_angle_difference(v1.superior_endplate_angle, v2.superior_endplate_angle),
+                compute_acute_angle_difference(v1.inferior_endplate_angle, v2.inferior_endplate_angle)
+            ]
 
-            tan_theta = abs((m1 - m2) / denominator)
-            theta = math.degrees(math.atan(tan_theta))
+            for k, angle in enumerate(angles):
+                if angle > max_angle and angle <= MAX_COBB_ANGLE:
+                    max_angle = angle
 
-            if theta > 60:
-                continue
+                    if k == 0:
+                        endplate1, endplate2 = 'superior', 'inferior'
+                        angle1, angle2 = v1.superior_endplate_angle, v2.inferior_endplate_angle
+                    elif k == 1:
+                        endplate1, endplate2 = 'inferior', 'superior'
+                        angle1, angle2 = v1.inferior_endplate_angle, v2.superior_endplate_angle
+                    elif k == 2:
+                        endplate1, endplate2 = 'superior', 'superior'
+                        angle1, angle2 = v1.superior_endplate_angle, v2.superior_endplate_angle
+                    else:
+                        endplate1, endplate2 = 'inferior', 'inferior'
+                        angle1, angle2 = v1.inferior_endplate_angle, v2.inferior_endplate_angle
 
-            if theta > max_cobb_angle:
-                max_cobb_angle = theta
-                upper_vertebra_id = valid_vertebrae[i].id
-                lower_vertebra_id = valid_vertebrae[j].id
+                    best_pair = {
+                        'superior_vertebra': v1.id,
+                        'inferior_vertebra': v2.id,
+                        'superior_endplate': endplate1,
+                        'inferior_endplate': endplate2,
+                        'superior_angle': angle1,
+                        'inferior_angle': angle2,
+                        'superior_center': v1.center,
+                        'inferior_center': v2.center
+                    }
 
-    # Round to nearest 0.5 degree
-    max_cobb_angle = round(max_cobb_angle * 2) / 2
+    if best_pair is None:
+        return {
+            'valid': False,
+            'max_angle': 0.0,
+            'superior_vertebra': None,
+            'inferior_vertebra': None
+        }
 
-    # Check if scoliosis exists
-    scoliosis_exists = max_cobb_angle > 10.0
-
-    return max_cobb_angle, upper_vertebra_id, lower_vertebra_id, scoliosis_exists
-
-
-def classify_scoliosis(angle: float) -> str:
-    """Classify scoliosis (English labels) based on Cobb angle."""
-    if angle < 10:
-        return "Normal"
-    elif angle < 25:
-        return "Mild Scoliosis"
-    elif angle < 40:
-        return "Moderate Scoliosis"
-    elif angle < 50:
-        return "Severe Scoliosis"
-    else:
-        return "Very Severe Scoliosis"
-
-
-
-def analyze_spine_from_image(image):
-    """
-    Analyze spine curvature from an X-ray image with green highlighted vertebrae
-    using Algorithm 1 and Algorithm 2, ignoring the topmost, bottommost, and
-    outlier vertebrae.
-    """
-    # Extract green mask
-    green_mask = extract_green_mask(image)
-
-    # Extract vertebrae using Algorithm 1 and identify outliers
-    result = extract_vertebrae(green_mask)
-    if len(result) == 3:
-        vertebrae, poly_coeffs, y_values = result
-    else:
-        vertebrae = result
-        poly_coeffs, y_values = None, None
-
-    # Default result values
     result = {
-        'cobb_angles': [],
-        'max_angle': 0,
-        'classification': 'Normal',
-        'vertebrae': [],
-        'confidence': 0,
-        'valid': False,
-        'spine_curve': {
-            'poly_coeffs': poly_coeffs,
-            'y_values': y_values.tolist() if y_values is not None else None
-        } if poly_coeffs is not None else None
+        'valid': True,
+        'max_angle': max_angle,
+        **best_pair
     }
 
-    # Check if enough vertebrae detected
-    if len(vertebrae) < 4:
-        result['error'] = 'Not enough vertebrae detected for reliable measurement'
-        return result
-
-    # Calculate Cobb angle using Algorithm 2
-    max_angle, upper_id, lower_id, scoliosis_exists = algorithm2_cobb_angle_measurement(vertebrae)
-
-    if max_angle > 0 and upper_id is not None and lower_id is not None:
-        # Find the vertebrae objects
-        upper_vertebra = next((v for v in vertebrae if v.id == upper_id), None)
-        lower_vertebra = next((v for v in vertebrae if v.id == lower_id), None)
-
-        if upper_vertebra and lower_vertebra:
-            # Create angle data
-            angle_data = {
-                'angle': max_angle,
-                'vertebra1': upper_id,
-                'vertebra2': lower_id,
-                'vertebra1_center': (upper_vertebra.center[1], upper_vertebra.center[0]),
-                'vertebra2_center': (lower_vertebra.center[1], lower_vertebra.center[0]),
-                'vertebra1_angle': math.degrees(math.atan(upper_vertebra.superior_endplate_slope)),
-                'vertebra2_angle': math.degrees(math.atan(lower_vertebra.inferior_endplate_slope))
-            }
-
-            # Calculate result confidence
-            vertebra_count_factor = min(1.0, len(vertebrae) / 8)
-            angle_confidence = min(1.0, max_angle / 15) if max_angle > 0 else 0.5
-
-            # Total confidence score
-            confidence = 0.9  # High confidence with the algorithm approach
-            confidence *= vertebra_count_factor * angle_confidence
-
-            # Update results
-            result['cobb_angles'] = [angle_data]
-            result['max_angle'] = max_angle
-            result['classification'] = classify_scoliosis(max_angle)
-            result['confidence'] = confidence
-            result['valid'] = True if scoliosis_exists else False
-
-    # Prepare vertebrae data for visualization
-    vertebrae_data = []
-    for v in vertebrae:
-        angle = 0
-        if v.superior_endplate_slope is not None:
-            angle = math.degrees(math.atan(v.superior_endplate_slope))
-        vertebrae_data.append({
-            'id': v.id,
-            'center': (v.center[1], v.center[0]),
-            'angle': angle,
-            'bbox': (v.bbox[1], v.bbox[0], v.bbox[3], v.bbox[2]),
-            'is_end_vertebra': v.is_end_vertebra,
-            'is_outlier': v.is_outlier,
-            'distance_from_curve': v.distance_from_curve
-        })
-    result['vertebrae'] = vertebrae_data
     return result
 
 
-def _draw_angle_arm(img, center_xy, angle_deg, length, color=(0, 0, 255), thick=6):
-    """Line through vertebral center with given orientation (anti-aliased)."""
-    cx, cy = int(center_xy[0]), int(center_xy[1])
-    rad = np.deg2rad(angle_deg)
-    x1 = int(cx - length * np.cos(rad))
-    y1 = int(cy - length * np.sin(rad))
-    x2 = int(cx + length * np.cos(rad))
-    y2 = int(cy + length * np.sin(rad))
-    cv2.line(img, (x1, y1), (x2, y2), color, thick, cv2.LINE_AA)
+def classify_scoliosis(cobb_angle: float) -> str:
+    """Classify scoliosis severity based on Cobb angle."""
+    if cobb_angle < NORMAL_THRESHOLD:
+        return "Normal"
+    elif cobb_angle < MILD_THRESHOLD:
+        return "Mild"
+    elif cobb_angle < MODERATE_THRESHOLD:
+        return "Moderate"
+    elif cobb_angle < SEVERE_THRESHOLD:
+        return "Severe"
+    else:
+        return "Very Severe"
 
 
-def _put_label(img, text, org, font, scale, color, thick, pad=6, alpha=0.45):
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+def analyze_spine_from_image(image: np.ndarray) -> Dict:
     """
-    Text with soft shadow + translucent background.
-    Returns ((x1,y1,x2,y2), (tw,th,base)) for downstream placement.
+    Main entry point for analyzing spine curvature from an X-ray image.
+    Now with improved robustness to imperfect segmentations.
+
+    Args:
+        image: BGR image with vertebrae highlighted in green/cyan
+
+    Returns:
+        Dictionary with:
+        - max_angle: Maximum Cobb angle in degrees
+        - classification: Severity classification
+        - valid: Whether measurement is valid
+        - cobb_angles: List of angle measurements
+        - vertebrae: List of vertebra information
     """
-    (tw, th), base = cv2.getTextSize(text, font, scale, thick)
-    x0, y0 = org
-    x1, y1 = x0 - pad, y0 - th - pad
-    x2, y2 = x0 + tw + pad, y0 + base + pad
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(img.shape[1]-1, x2), min(img.shape[0]-1, y2)
+    # Step 1: Extract the green mask
+    mask = extract_green_mask(image)
 
-    overlay = img.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+    # Step 2: Extract individual vertebrae with improved processing
+    vertebrae = extract_vertebrae(mask)
 
-    # shadow + text
-    cv2.putText(img, text, (org[0] + 1, org[1] + 1), font, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
-    cv2.putText(img, text, org, font, scale, color, thick, cv2.LINE_AA)
-    return (x1, y1, x2, y2), (tw, th, base)
+    if len(vertebrae) == 0:
+        return {
+            'max_angle': 0.0,
+            'classification': 'Normal',
+            'valid': False,
+            'cobb_angles': [],
+            'vertebrae': []
+        }
+
+    # Step 3: Apply minimum enclosing rectangle algorithm
+    for vert in vertebrae:
+        algorithm1_minimum_enclosing_rectangle(vert)
+
+    # Step 4: Mark outliers
+    mark_outliers(vertebrae)
+
+    # Step 5: Measure Cobb angle
+    cobb_result = algorithm2_cobb_angle_measurement(vertebrae)
+
+    max_angle = cobb_result['max_angle']
+    classification = classify_scoliosis(max_angle)
+
+    # Build response
+    cobb_angles = []
+    if cobb_result['valid'] and cobb_result['superior_vertebra'] is not None:
+        sup_center = cobb_result['superior_center']
+        inf_center = cobb_result['inferior_center']
+
+        cobb_angles.append({
+            'angle': max_angle,
+            'vertebra1': cobb_result['superior_vertebra'],
+            'vertebra2': cobb_result['inferior_vertebra'],
+            'vertebra1_center': (sup_center[1], sup_center[0]),
+            'vertebra2_center': (inf_center[1], inf_center[0]),
+            'vertebra1_angle': cobb_result['superior_angle'],
+            'vertebra2_angle': cobb_result['inferior_angle']
+        })
+
+    vertebrae_list = []
+    for vert in vertebrae:
+        vert_dict = {
+            'id': vert.id,
+            'center': (vert.center[1], vert.center[0]),
+            'angle': vert.superior_endplate_angle if vert.superior_endplate_angle is not None else 0.0,
+            'bbox': (
+                list(vert.min_rect[0]) + [vert.min_rect[1][0], vert.min_rect[1][1]]
+                if vert.min_rect else [0, 0, 0, 0]
+            ),
+            'is_end': vert.is_end_vertebra,
+            'is_outlier': vert.is_outlier,
+            'area': vert.area,
+            'solidity': vert.solidity,
+            'aspect_ratio': vert.aspect_ratio
+        }
+        vertebrae_list.append(vert_dict)
+
+    return {
+        'max_angle': max_angle,
+        'classification': classification,
+        'valid': cobb_result['valid'],
+        'cobb_angles': cobb_angles,
+        'vertebrae': vertebrae_list,
+        '_vertebrae_objects': vertebrae,  # Internal: for visualization
+        '_cobb_result': cobb_result  # Internal: for visualization
+    }
 
 
-def _label_with_degree(img, text_wo_deg, org, font, scale, color, thick,
-                       pad=6, alpha=0.45, deg_radius=3, deg_dx=2, deg_dy=2):
+# ============================================================================
+# Visualization
+# ============================================================================
+
+def visualize_results(image: np.ndarray, analysis_results: Dict) -> np.ndarray:
     """
-    Writes e.g. '32.0' then draws a small superscript circle as degree sign.
-    Avoids unsupported '°' glyph → no more '??'.
+    Enhanced visualization showing ROI, vertebrae, and measurements.
     """
-    _, (tw, th, _base) = _put_label(img, text_wo_deg, org, font, scale, color, thick, pad, alpha)
-    cx = org[0] + tw + deg_dx                 # to the right of the text
-    cy = org[1] - th + deg_dy                 # superscript position
-    cv2.circle(img, (int(cx), int(cy)), int(deg_radius), color, -1, cv2.LINE_AA)
+    vis_image = image.copy()
 
-# --- main visualization ----------------------------------------------------
+    vertebrae_objects = analysis_results.get('_vertebrae_objects', [])
+    cobb_result = analysis_results.get('_cobb_result', {})
+    max_angle = analysis_results.get('max_angle', 0.0)
+    classification = analysis_results.get('classification', 'Normal')
 
-def visualize_results(image, analysis_results):
-    """Visualize analysis results on original image with fixed sizes (no change)."""
-    vis_image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) if len(image.shape) == 2 else image.copy()
-    H, W = vis_image.shape[:2]
+    if len(vertebrae_objects) == 0:
+        cv2.putText(
+            vis_image, "No vertebrae detected", (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2
+        )
+        return vis_image
 
-    # dynamic scale (kept as before; you asked not to change sizes)
-    base_h = 1024.0
-    sf = max(0.8, min(3.0, H / base_h))
+    # Draw spine centerline if possible
+    if len(vertebrae_objects) >= 3:
+        try:
+            poly_func, _ = fit_spine_centerline(vertebrae_objects, degree=3)
 
-    FONT = cv2.FONT_HERSHEY_SIMPLEX
-    COL_TEXT  = (0, 220, 255)
-    COL_CURVE = (255, 255, 0)
-    COL_ANGLE = (0, 0, 255)
-    COL_IN    = (40, 220, 40)
-    COL_END   = (0, 165, 255)
-    COL_OUT   = (0, 0, 255)
+            x_coords = [v.center[1] for v in vertebrae_objects]
+            x_min, x_max = min(x_coords), max(x_coords)
+            x_curve = np.linspace(x_min, x_max, 100)
+            y_curve = poly_func(x_curve)
 
-    fs_small  = 0.6 * sf
-    fs_med    = 0.95 * sf
-    fs_big    = 1.15 * sf
-    th_text   = max(1, int(round(2 * sf)))
-    th_curve  = max(2, int(round(3 * sf)))
-    th_angle  = max(3, int(round(6 * sf)))
-    r_dot     = max(4, int(round(5 * sf)))
-    line_len  = max(H, W) // 3
-    deg_r     = max(2, int(round(3 * sf)))  # degree-dot size
+            pts = np.column_stack([x_curve, y_curve]).astype(np.int32)
+            for i in range(len(pts) - 1):
+                cv2.line(vis_image, tuple(pts[i]), tuple(pts[i+1]), (255, 255, 0), 2)
+        except:
+            pass
 
-    # spine curve
-    sc = analysis_results.get('spine_curve', None)
-    if sc is not None and sc.get('y_values') is not None:
-        poly = np.array(sc.get('poly_coeffs'))
-        ys = np.array(sc.get('y_values'))
-        if poly is not None and len(poly) > 0:
-            f = np.poly1d(poly)
-            xs = f(ys)
-            pts = np.column_stack((xs.astype(np.int32), ys.astype(np.int32))).reshape((-1, 1, 2))
-            cv2.polylines(vis_image, [pts], False, COL_CURVE, th_curve, cv2.LINE_AA)
+    # Draw vertebra centers and information
+    for vert in vertebrae_objects:
+        cx, cy = int(vert.center[1]), int(vert.center[0])
 
-    # vertebrae dots + ids
-    for v in analysis_results.get('vertebrae', []):
-        c = tuple(int(a) for a in v['center'])
-        if v.get('is_outlier', False):
-            color = COL_OUT
-        elif v.get('is_end_vertebra', False):
-            color = COL_END
+        # Color coding
+        if vert.is_end_vertebra:
+            color = (0, 165, 255)  # Orange
+            radius = 5
+        elif vert.is_outlier:
+            color = (0, 0, 255)  # Red
+            radius = 5
         else:
-            color = COL_IN
-        cv2.circle(vis_image, c, r_dot, color, -1, cv2.LINE_AA)
-        cv2.putText(vis_image, str(v['id']), (c[0] + int(8 * sf), c[1]),
-                    FONT, max(0.45, 0.45 * sf), (255, 255, 255), 1, cv2.LINE_AA)
+            color = (0, 255, 0)  # Green
+            radius = 4
 
-    # Cobb arms + mid-text (with degree dot)
-    for ad in analysis_results.get('cobb_angles', []):
-        if ad['angle'] == 0:
-            continue
-        v1c = tuple(int(a) for a in ad['vertebra1_center'])
-        v2c = tuple(int(a) for a in ad['vertebra2_center'])
-        _draw_angle_arm(vis_image, v1c, ad['vertebra1_angle'], line_len, COL_ANGLE, th_angle)
-        _draw_angle_arm(vis_image, v2c, ad['vertebra2_angle'], line_len, COL_ANGLE, th_angle)
-        cv2.line(vis_image, v1c, v2c, COL_ANGLE, max(2, th_angle - 3), cv2.LINE_AA)
+        cv2.circle(vis_image, (cx, cy), radius, color, -1)
+        cv2.circle(vis_image, (cx, cy), radius + 2, (255, 255, 255), 1)
 
-        mid_x = (v1c[0] + v2c[0]) // 2
-        mid_y = (v1c[1] + v2c[1]) // 2
-        _label_with_degree(
-            vis_image, f"{ad['angle']:.1f}",
-            (mid_x + int(18 * sf), mid_y),
-            FONT, fs_med, COL_ANGLE, th_text,
-            pad=max(4, int(6 * sf)), deg_radius=deg_r, deg_dx=max(2, int(2 * sf)), deg_dy=max(2, int(2 * sf))
+        # Draw ID and area
+        text = f"{vert.id}"
+        if vert.area > 0:
+            text += f" ({int(vert.area)})"
+        cv2.putText(
+            vis_image, text, (cx + 10, cy),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1
         )
 
-    # header (with degree dot), classification & legend
-    max_angle = float(analysis_results.get('max_angle', 0.0))
-    classification = analysis_results.get('classification', 'Normal')
-    y0 = int(36 * sf)
+    # Draw endplate lines for selected pair
+    if cobb_result.get('valid') and cobb_result.get('superior_vertebra'):
+        sup_vert = None
+        inf_vert = None
+        for v in vertebrae_objects:
+            if v.id == cobb_result['superior_vertebra']:
+                sup_vert = v
+            if v.id == cobb_result['inferior_vertebra']:
+                inf_vert = v
 
-    _label_with_degree(
-        vis_image, f"Max Cobb Angle: {max_angle:.1f}",
-        (int(28 * sf), y0),
-        FONT, fs_big, COL_TEXT, th_text,
-        pad=max(6, int(8 * sf)), deg_radius=deg_r, deg_dx=max(3, int(3 * sf)), deg_dy=max(3, int(3 * sf))
-    )
-    _put_label(vis_image, f"Classification: {classification}",
-               (int(28 * sf), y0 + int(34 * sf)), FONT, fs_med, COL_TEXT, th_text, pad=max(6, int(8 * sf)))
-    _put_label(vis_image, "Excluded: end vertebrae & distant outliers",
-               (int(28 * sf), y0 + int(64 * sf)), FONT, fs_small, (0, 200, 255), th_text, pad=max(5, int(7 * sf)))
+        if sup_vert and sup_vert.superior_endplate_points is not None:
+            points = sup_vert.superior_endplate_points.astype(np.int32)
+            if len(points) >= 2:
+                p1, p2 = points[0], points[-1]
+                # Extend the line for better visualization
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                length = np.sqrt(dx**2 + dy**2)
+                if length > 0:
+                    dx, dy = dx/length, dy/length
+                    p1_ext = (int(p1[0] - dx * 30), int(p1[1] - dy * 30))
+                    p2_ext = (int(p2[0] + dx * 30), int(p2[1] + dy * 30))
+                    cv2.line(vis_image, p1_ext, p2_ext, (0, 0, 255), 2)
+
+        if inf_vert and inf_vert.inferior_endplate_points is not None:
+            points = inf_vert.inferior_endplate_points.astype(np.int32)
+            if len(points) >= 2:
+                p1, p2 = points[0], points[-1]
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                length = np.sqrt(dx**2 + dy**2)
+                if length > 0:
+                    dx, dy = dx/length, dy/length
+                    p1_ext = (int(p1[0] - dx * 30), int(p1[1] - dy * 30))
+                    p2_ext = (int(p2[0] + dx * 30), int(p2[1] + dy * 30))
+                    cv2.line(vis_image, p1_ext, p2_ext, (0, 0, 255), 2)
+
+    # Add text overlay with shadowed background
+    y_offset = 30
+    line_height = 35
+
+    # Create semi-transparent overlay for text background
+    overlay = vis_image.copy()
+    cv2.rectangle(overlay, (5, 5), (350, 120), (0, 0, 0), -1)
+    vis_image = cv2.addWeighted(vis_image, 0.7, overlay, 0.3, 0)
+
+    # Draw text with shadow effect
+    texts = [
+        (f"Cobb Angle: {max_angle:.1f}°", (10, y_offset)),
+        (f"Classification: {classification}", (10, y_offset + line_height)),
+        ("Enhanced detection with ROI & separation", (10, y_offset + line_height * 2))
+    ]
+
+    for text, (x, y) in texts:
+        # Shadow
+        cv2.putText(vis_image, text, (x+1, y+1),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        # Main text
+        cv2.putText(vis_image, text, (x, y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     return vis_image
+
+
+# ============================================================================
+# Backwards Compatibility Function
+# ============================================================================
+
+def measure_cobb_angle_from_green_overlay(image_bgr: np.ndarray) -> Dict:
+    """
+    Backward compatible function name for measuring Cobb angle.
+
+    Args:
+        image_bgr: BGR image with green vertebra overlay
+
+    Returns:
+        Dictionary with measurement results
+    """
+    return analyze_spine_from_image(image_bgr)

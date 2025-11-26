@@ -49,7 +49,7 @@ TEMP_DIR = os.path.join(project_dir, "temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 # Define model path
-MODEL_PATH = os.path.join(project_dir, "models", "unet_model_best_colab_harun.pth")
+MODEL_PATH = os.path.join(project_dir, "models", "unet_best_model.pth")
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Load the model
@@ -75,7 +75,7 @@ def load_model():
 
         try:
             model = UNet(n_channels=3, n_classes=1, bilinear=True)
-            model.load_state_dict(torch.load(alt_model_path, map_location=DEVICE))
+            model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
             model.to(DEVICE)
             model.eval()
             print(f"Model loaded successfully from {alt_model_path}")
